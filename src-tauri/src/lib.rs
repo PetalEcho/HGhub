@@ -1,4 +1,6 @@
 mod api;
+mod edge_crypto;
+mod playback;
 mod lines;
 mod logging;
 #[cfg(target_os = "macos")]

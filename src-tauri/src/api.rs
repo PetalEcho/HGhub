@@ -296,6 +296,7 @@ pub async fn app_boot(state: State<'_, Api>) -> Result<Value, String> {
 #[tauri::command]
 pub async fn security_set(strict: bool) -> Result<bool, String> {
     crate::network_policy::set_strict_security(strict)?;
+    crate::playback::invalidate();
     crate::net::refresh_client();
     crate::playback_log::record(
         "security.mode_changed",
@@ -465,9 +466,13 @@ pub async fn api_video(state: State<'_, Api>, id: i64) -> Result<Value, String> 
 
 #[tauri::command]
 pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
-    state
-        .get(&format!("/api/videos/{id}/play?ep={ep}&page_texts=0"))
-        .await
+    let origin = base();
+    let identity = state.session.snapshot(&origin);
+    let result = crate::playback::prepare(&origin, identity.1.as_deref(), id, ep).await;
+    if base() != origin || state.session.snapshot(&origin) != identity {
+        return Err("登录状态或线路已变化，请重试".into());
+    }
+    result
 }
 
 /* ───────────────────────── 评论 / 互动 ───────────────────────── */

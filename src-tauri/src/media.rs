@@ -207,7 +207,7 @@ pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, Strin
     Ok(arc)
 }
 
-fn rewrite_playlist(url: &str, text: &str, prefix: &str) -> String {
+pub(crate) fn rewrite_playlist(url: &str, text: &str, prefix: &str) -> String {
     let mut out = String::with_capacity(text.len() + 512);
     for raw in text.trim_start_matches('\u{feff}').lines() {
         let line = raw.trim_end();
@@ -352,6 +352,9 @@ fn segment_response(
 /// `origin` 是本平台自定义协议的完整基址，见 [`LOCAL_ORIGIN`]；用于改写 m3u8 里的
 /// 分片与 key 地址。正常情况下调用方直接传 [`LOCAL_ORIGIN`]。
 pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> {
+    if path.starts_with("/play/") {
+        return crate::playback::handle(path, query).await;
+    }
     let target = query
         .split('&')
         .find_map(|kv| kv.strip_prefix("u="))

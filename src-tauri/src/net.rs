@@ -611,6 +611,71 @@ pub async fn edge(
     }
 }
 
+/// Fixed playback gateway: no redirects, no replay, bounded decompressed response,
+/// and no remote response text or transport URLs in errors.
+pub(crate) async fn playback_post(origin: &str, packet: &Value) -> Result<Value, String> {
+    let origin = normalize_base(origin).ok_or("播放线路无效")?;
+    let started = Instant::now();
+    let phase = if packet.get("type").and_then(Value::as_str) == Some("hello") { "hello" } else { "call" };
+    let mut status = None;
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        let (target, client) = client_for(&format!("{origin}/api/playback/request")).await
+            .map_err(|_| "播放网关地址校验或连接失败".to_string())?;
+        let mut response = client.post(target).header("Accept", "application/json")
+            .header("Referer", format!("{origin}/")).json(packet).send().await
+            .map_err(|_| "播放网关连接失败".to_string())?;
+        status = Some(response.status().as_u16());
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}：播放网关请求失败", response.status().as_u16()));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| "播放网关响应读取失败")? {
+            if bytes.len() + chunk.len() > 2 * 1024 * 1024 { return Err("播放网关响应过大".into()); }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| "播放网关响应格式无效".to_string())
+    }).await.unwrap_or_else(|_| Err("播放网关请求超时".into()));
+    crate::playback_log::record("playback.gateway", json!({
+        "phase": phase, "status": status, "ok": result.is_ok(),
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+        "line_host": url::Url::parse(&origin).ok().and_then(|u| u.host_str().map(str::to_owned)),
+    }));
+    result
+}
+
+fn media_credentials_allowed(target: &url::Url, auth_origin: &str) -> bool {
+    target.scheme() == "https" && target.origin().ascii_serialization() == auth_origin
+}
+
+/// Ticket media fetch. Credentials are sent only to the original HTTPS origin;
+/// each redirect rechecks policy and can never expand that credential scope.
+pub(crate) async fn playback_bytes(raw: &str, auth_origin: &str, line: &str, headers: reqwest::header::HeaderMap) -> Result<(String, Vec<u8>, String), String> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut next = network_policy::parse_target(raw).map_err(|_| "播放资源地址无效")?;
+        for hop in 0..=5 {
+            let (target, client) = client_for(next.as_str()).await.map_err(|_| "播放资源地址校验或连接失败")?;
+            let mut req = client.get(target.clone()).header("Referer", format!("{line}/"));
+            if media_credentials_allowed(&target, auth_origin) { req = req.headers(headers.clone()); }
+            let mut res = req.send().await.map_err(|_| "播放资源连接失败")?;
+            if res.status().is_redirection() {
+                if hop == 5 { return Err("播放资源重定向次数过多".into()); }
+                let location = res.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()).ok_or("播放资源重定向无效")?;
+                next = network_policy::redirect_target(&target, location).map_err(|_| "播放资源重定向未通过安全校验")?;
+                continue;
+            }
+            if !res.status().is_success() { return Err(format!("HTTP {}：播放资源请求失败", res.status().as_u16())); }
+            let mime = res.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream").to_string();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = res.chunk().await.map_err(|_| "播放资源读取失败")? {
+                if bytes.len() + chunk.len() > 32 * 1024 * 1024 { return Err("播放资源超过大小限制".into()); }
+                bytes.extend_from_slice(&chunk);
+            }
+            return Ok((mime, bytes, target.to_string()));
+        }
+        Err("播放资源重定向失败".into())
+    }).await.unwrap_or_else(|_| Err("播放资源请求超时".into()))
+}
+
 /// 拉原始字节（图片 / m3u8 / 分片）。
 pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String> {
     static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -655,6 +720,15 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cdn_credentials_never_cross_https_origin() {
+        let origin = "https://cdn.example";
+        assert!(media_credentials_allowed(&url::Url::parse("https://cdn.example:443/other?signature=test").unwrap(), origin));
+        for target in ["http://cdn.example/a", "https://cdn.example:444/a", "https://other.example/a", "https://cdn.example.evil.test/a"] {
+            assert!(!media_credentials_allowed(&url::Url::parse(target).unwrap(), origin));
+        }
+    }
 
     #[tokio::test]
     async fn terminal_errors_do_not_retry_but_transient_failures_can_recover() {

@@ -39,7 +39,10 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [index, setIndex] = useState(startIndex);
   const [epMap, setEpMap] = useState<Record<number, number>>(() => (startEp ? { [videoIds[startIndex]]: startEp } : {}));
   const [details, setDetails] = useState<Record<number, Detail>>({});
-  const [playUrls, setPlayUrls] = useState<Record<string, string>>({});
+  // Signed playback tickets belong to one entry/retry, not an indefinite episode cache.
+  const [playAttempt, setPlayAttempt] = useState(0);
+  const [playSource, setPlaySource] = useState<{ key: string; attempt: number; url: string; autoPlay: boolean } | null>(null);
+  const retryIntentRef = useRef<{ key: string; autoPlay: boolean } | null>(null);
   const [cards] = useState<Record<number, VideoCard>>({});
   const [posts, setPosts] = useState<Record<number, Post>>({});
 
@@ -126,7 +129,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const detail = details[curId];
   const curEp = epMap[curId] || 1;
   const playKey = `${curId}:${curEp}`;
-  const playUrl = playUrls[playKey] || "";
+  const currentSource = playSource?.key === playKey && playSource.attempt === playAttempt ? playSource : null;
+  const playUrl = kind === "post" ? posts[curId]?.video_url || "" : currentSource?.url || "";
   useEffect(() => { videoRef.current?.trace("page.active", { active, view: mode, video_id: curId, episode: curEp }); }, [active, mode, curId, curEp]);
   const episodes = detail?.episodes || [];
   const post = posts[curId];
@@ -336,6 +340,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
   /* 拉详情（当前 + 邻接预取） */
   useEffect(() => {
+    if (kind !== "video") return;
     let alive = true;
     const need = [videoIds[index], videoIds[index + 1], videoIds[index - 1]].filter(Boolean);
     need.forEach((id) => {
@@ -344,7 +349,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [index, videoIds]);
+  }, [kind, index, videoIds]);
 
   /* 吃瓜帖子：直接拿帖子详情（含 video_url） */
   useEffect(() => {
@@ -358,25 +363,49 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, index, videoIds]);
 
-  /* 拉播放地址 */
+  /* 每次进入集数或重试都重新取票据；过期请求不能覆盖当前集数。 */
   useEffect(() => {
-    if (!curId) return;
-    if (playUrls[playKey]) return;
+    if (kind !== "video" || !curId) return;
     let alive = true;
+    const autoPlay = retryIntentRef.current?.key === playKey ? retryIntentRef.current.autoPlay : true;
+    setPlaySource(null);
+    setErr("");
+    setWaiting(true);
     api.play(curId, curEp)
       .then((info) => {
         if (!alive) return;
-        if (!info?.video_url) throw new Error("暂无播放地址");
-        setPlayUrls((m) => ({ ...m, [playKey]: info.video_url }));
+        if (!info?.video_url?.trim()) throw new Error("暂无播放地址");
+        setPlaySource({ key: playKey, attempt: playAttempt, url: info.video_url, autoPlay });
         addHistory(curId, curEp);
       })
-      .catch((e) => { if (alive) setErr((e as Error).message || "取播放地址失败"); });
+      .catch((e) => {
+        if (!alive) return;
+        setWaiting(false);
+        setErr((e as Error).message || "取播放地址失败");
+      });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [curId, curEp]);
+  }, [kind, curId, curEp, playAttempt]);
+
+  const retryPlayback = () => {
+    setErr("");
+    setWaiting(true);
+    if (kind === "post") {
+      videoRef.current?.reload();
+      return;
+    }
+    const video = videoRef.current?.el();
+    const previousIntent = retryIntentRef.current;
+    const autoPlay = video ? !video.paused : previousIntent?.key === playKey ? previousIntent.autoPlay : !paused;
+    retryIntentRef.current = { key: playKey, autoPlay };
+    const position = video?.currentTime || time;
+    if (position > 1) resumeRef.current = { key: playKey, t: position };
+    setPlayAttempt((attempt) => attempt + 1);
+  };
 
   /* 切换条目/集数时重置播放与缩放状态 */
   useEffect(() => {
+    retryIntentRef.current = null;
     setTime(0); setDuration(0); setBuffered(0); setErr(""); setWaiting(true); setPaused(false); setDescOpen(false);
     setVsize({ w: 0, h: 0 });
     setPortraitFit("contain");
@@ -816,7 +845,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       ref={videoRef}
                       src={playUrl}
                       poster={fs ? undefined : posterUrl}
-                      autoPlay
+                      autoPlay={kind === "post" || (currentSource?.autoPlay ?? true)}
                       active={active}
                       diagnosticContext={{ active, view: mode, kind, video_id: curId, episode: curEp }}
                       muted={muted}
@@ -861,18 +890,6 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                   )}
                   {waiting && !err && !paused && (
                     <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none"><div className="w-9 h-9 spinner" /></div>
-                  )}
-                  {err && (
-                    <div className="absolute inset-0 z-30 flex items-center justify-center">
-                      <div className="rounded-xl p-5 flex flex-col items-center gap-3 text-[13px] hg-ink-2" style={{ background: "rgba(0,0,0,.74)" }}>
-                        <span>视频暂时无法加载</span>
-                        <span className="text-[10.5px] hg-ink-4 max-w-[240px] text-center break-all">{err}</span>
-                        <button className="px-4 py-1.5 rounded-full hg-chip-strong hg-link text-[12.5px] font-semibold pressable"
-                          onClick={() => { setErr(""); setWaiting(true); videoRef.current?.reload(); }}>
-                          重新加载
-                        </button>
-                      </div>
-                    </div>
                   )}
 
                   {/* 移动端：倍速状态 / 锁定提示 */}
@@ -959,6 +976,20 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                 <div className="absolute inset-0">
                   <Img src={cards[vid]?.cover || posts[vid]?.cover || details[vid]?.cover || (isActive ? detail?.cover : "") || ""} eager={Math.abs(i - index) <= 1} />
                   <div className="absolute inset-0" style={{ background: "rgba(0,0,0,.25)" }} />
+                </div>
+              )}
+
+              {/* 取地址失败时尚无 VideoSurface，重试入口也必须可用。 */}
+              {isActive && err && hasVideo && (
+                <div className="absolute inset-0 z-30 flex items-center justify-center">
+                  <div className="rounded-xl p-5 flex flex-col items-center gap-3 text-[13px] hg-ink-2" style={{ background: "rgba(0,0,0,.74)" }}>
+                    <span>视频暂时无法加载</span>
+                    <span className="text-[10.5px] hg-ink-4 max-w-[240px] text-center break-all">{err}</span>
+                    <button className="px-4 py-1.5 rounded-full hg-chip-strong hg-link text-[12.5px] font-semibold pressable"
+                      onClick={retryPlayback}>
+                      重新加载
+                    </button>
+                  </div>
                 </div>
               )}
 

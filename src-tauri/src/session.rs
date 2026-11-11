@@ -13,6 +13,8 @@ pub struct Session {
     pub token: String,
     #[serde(default)]
     pub user: serde_json::Value,
+    #[serde(skip)]
+    revision: u64,
 }
 
 #[cfg(test)]
@@ -37,6 +39,22 @@ mod tests {
         assert!(store.user("https://evil.example").is_null());
         store.clear();
         assert_eq!(store.token("https://huangguoai.com"), None);
+    }
+
+    #[test]
+    fn identity_generation_survives_guest_and_same_token_roundtrips() {
+        let store = SessionStore::new();
+        let origin = "https://huangguoai.com";
+        let guest = store.snapshot(origin);
+        store.set(origin, "token".into(), json!({"id":1}));
+        let logged_in = store.snapshot(origin);
+        store.set(origin, "token".into(), json!({"id":1,"name":"updated"}));
+        assert_eq!(store.snapshot(origin), logged_in);
+        store.clear();
+        assert_ne!(store.snapshot(origin), guest);
+        store.set(origin, "token".into(), json!({"id":1}));
+        assert_ne!(store.snapshot(origin), logged_in);
+        assert!(serde_json::to_value(store.current.lock().unwrap().clone()).unwrap().get("revision").is_none());
     }
 
     #[test]
@@ -73,6 +91,12 @@ impl SessionStore {
         *self.file.lock().unwrap() = Some(path);
     }
 
+    /// Capture identity and its generation under one lock; never persist the generation.
+    pub fn snapshot(&self, origin: &str) -> (u64, Option<String>) {
+        let cur = self.current.lock().unwrap();
+        (cur.revision, (cur.origin == origin && !cur.token.is_empty()).then(|| cur.token.clone()))
+    }
+
     pub fn token(&self, origin: &str) -> Option<String> {
         let cur = self.current.lock().unwrap();
         (cur.origin == origin && !cur.token.is_empty()).then(|| cur.token.clone())
@@ -88,22 +112,29 @@ impl SessionStore {
     }
 
     pub fn set(&self, origin: &str, token: String, user: serde_json::Value) {
-        {
+        let changed = {
             let mut cur = self.current.lock().unwrap();
+            let changed = cur.origin != origin || cur.token != token;
+            if changed { cur.revision = cur.revision.wrapping_add(1); }
             cur.origin = origin.to_string();
             cur.token = token;
             cur.user = user;
-        }
+            changed
+        };
+        // A profile refresh with the same credential must not interrupt playback.
+        if changed { crate::playback::invalidate(); }
         self.persist();
     }
 
     pub fn clear(&self) {
         {
             let mut cur = self.current.lock().unwrap();
+            cur.revision = cur.revision.wrapping_add(1);
             cur.token.clear();
             cur.origin.clear();
             cur.user = serde_json::Value::Null;
         }
+        crate::playback::invalidate();
         self.persist();
     }
 

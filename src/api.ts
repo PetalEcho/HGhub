@@ -147,42 +147,37 @@ export async function selfTest(): Promise<string> {
   const steps: string[] = [];
   try {
     const info = await api.play(117, 3);
-    steps.push(`play:${info?.video_url ? "ok" : "empty"}`);
-    const hlsUrl = `${LOCAL}/hls?u=${encodeURIComponent(info.video_url)}`;
+    const videoUrl = info?.video_url?.trim();
+    steps.push(`play:${videoUrl ? "ok" : "empty"}`);
+    if (!videoUrl) return steps.join(" | ");
+    const hlsUrl = isLocalMedia(videoUrl) ? videoUrl : playlist(videoUrl);
     const r1 = await fetch(hlsUrl);
     const txt = await r1.text();
     steps.push(`hls:${r1.status}/${txt.length}/${txt.startsWith("#EXTM3U") ? "m3u8" : "bad"}`);
+    if (!r1.ok || !txt.startsWith("#EXTM3U")) return steps.join(" | ");
     const keyLine = txt.split("\n").find((l) => l.startsWith("#EXT-X-KEY"));
     if (keyLine) {
       const m = keyLine.match(/URI="([^"]+)"/);
       if (m) {
         const rustUrl = m[1];
-        steps.push(`rustUrl:${rustUrl.slice(0, 60)}`);
-        // A/B：用 JS 重新编码同一条上游地址
-        const inner = decodeURIComponent(rustUrl.split("?u=")[1] || "");
-        steps.push(`inner:${inner.slice(0, 50)}`);
         try {
           const rk = await fetch(rustUrl);
           const bk = await rk.arrayBuffer();
           steps.push(`keyRust:${rk.status}/${bk.byteLength}`);
-        } catch (e) { steps.push(`keyRust:throw:${(e as Error).message.slice(0, 30)}`); }
-        try {
-          const rk2 = await fetch(`${LOCAL}/seg?u=${encodeURIComponent(inner)}`);
-          const bk2 = await rk2.arrayBuffer();
-          steps.push(`keyJs:${rk2.status}/${bk2.byteLength}`);
-        } catch (e) { steps.push(`keyJs:throw:${(e as Error).message.slice(0, 30)}`); }
+        } catch { steps.push("keyRust:throw"); }
       }
     }
-    const segLine = txt.split("\n").find((l) => l && !l.startsWith("#") && l.includes("/seg?u="));
+    const segLine = txt.split("\n").find((l) => isLocalMedia(l.trim()) && !l.trim().startsWith("#"));
     if (segLine) {
       try {
         const r2 = await fetch(segLine.trim());
         const buf = await r2.arrayBuffer();
         steps.push(`seg:${r2.status}/${buf.byteLength}`);
-      } catch (e) { steps.push(`seg:throw:${(e as Error).message.slice(0, 40)}`); }
+      } catch { steps.push("seg:throw"); }
     } else steps.push("seg:no-line");
-  } catch (e) {
-    steps.push(`err:${(e as Error).message.slice(0, 60)}`);
+  } catch {
+    // Exceptions may contain signed URLs, ticket IDs or decrypted response text.
+    steps.push("err:request_failed");
   }
   return steps.join(" | ");
 }
